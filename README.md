@@ -165,7 +165,7 @@ The compiled binary is completely standalone and can run on any compatible syste
 ### Project Structure
 ```
 .
-├── nserve.nim          # Main server code (~360 lines)
+├── nserve.nim          # Main server code (~430 lines)
 └── README.md          # This file
 ```
 
