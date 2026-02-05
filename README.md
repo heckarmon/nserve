@@ -1,6 +1,8 @@
 # NServe: A Simple HTTP Nim File Server 🚀
 
-A lightweight, blazingly fast HTTP file server written in Nim with a modern dark/light theme UI and colored request logging. **Zero runtime dependencies** - just a single executable!
+> A lightweight, blazingly fast HTTP file server written in Nim with a modern dark/light theme UI and colored request logging. **Zero runtime dependencies** - just a single executable!
+
+![NServe UI Sneak Peek](nserve_sneak.png)
 
 ## Features ✨
 
