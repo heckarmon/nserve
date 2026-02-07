@@ -12,20 +12,23 @@ Usage:
   nserve [options] [directory]
 
 Options:
-  -p, --port     Set the port (default: 8000)
-  -H, --host     Set the host address (default: 0.0.0.0)
-  -d, --dir      Set the directory to serve (default: current dir)
-  -h, --help     Show this help message
+  -p, --port        Set the port (default: 8000)
+  -H, --host        Set the host address (default: 0.0.0.0)
+  -d, --dir         Set the directory to serve (default: current dir)
+  -m, --max-size    Set max upload size in MB (default: 100)
+  -h, --help        Show this help message
 
 Syntax Notes:
   • Short flags (-d, -p) use space or colon:   -d ./waw  OR  -d:./waw
   • Long flags (--dir) use equals or colon:    --dir=./waw
 
 Examples:
-  nserve ./waw              # Serve directory directly (Recommended)
-  nserve -p 8080            # Serve current dir on port 8000
-  nserve -d:./html -p:3000  # Short options with colons
-  nserve --dir=/var/www     # Long options
+  nserve ./waw                # Serve directory directly (Recommended)
+  nserve -p 8080              # Serve current dir on port 8080
+  nserve -d:./html -p:3000    # Short options with colons
+  nserve --dir=/var/www       # Long options
+  nserve -m 500               # Allow uploads up to 500MB
+  nserve --max-size=1024      # Allow uploads up to 1GB
 """
   quit(0)
 
@@ -94,15 +97,23 @@ body {
   font-family: sans-serif;
   padding: 20px;
 }
-a { color: #4da3ff; text-decoration: none; }
+a {
+  color: inherit;
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
 .card {
   background: var(--card);
   padding: 12px;
   border-radius: 8px;
   margin-bottom: 8px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  transition: transform 0.1s;
+}
+.card:hover {
+  transform: translateX(4px);
 }
 .card.dir {
   border-left: 4px solid var(--dir-color);
@@ -119,6 +130,12 @@ a { color: #4da3ff; text-decoration: none; }
   min-width: 24px;
 }
 button { padding: 6px 10px; cursor: pointer; }
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.error { color: #ff4444; margin-top: 10px; font-weight: bold; }
+.warning { color: #ff9500; margin-top: 5px; font-size: 0.9em; }
 </style>
 </head>
 <body>
@@ -148,15 +165,56 @@ function toggleTheme() {
 # Directory Listing
 # --------------------------
 
-proc dirListing(path: string, urlPath: string): string =
+proc dirListing(path: string, urlPath: string, maxSizeMB: int): string =
   var content = "<h1>Index of " & urlPath & "</h1>"
 
+  let maxSizeBytes = maxSizeMB * 1024 * 1024
+  
   content.add("""
-<form method="POST" enctype="multipart/form-data">
-  <input type="file" name="file">
-  <button type="submit">Upload</button>
+<form method="POST" enctype="multipart/form-data" id="uploadForm">
+  <input type="file" name="file" id="fileInput">
+  <button type="submit" id="uploadBtn">Upload</button>
+  <span style="margin-left: 10px; font-size: 0.9em; opacity: 0.7;">Max: """ & $maxSizeMB & """ MB</span>
+  <div id="fileWarning" class="warning" style="display: none;"></div>
 </form>
 <hr>
+
+<script>
+const maxSize = """ & $maxSizeBytes & """;
+const fileInput = document.getElementById('fileInput');
+const uploadBtn = document.getElementById('uploadBtn');
+const fileWarning = document.getElementById('fileWarning');
+const uploadForm = document.getElementById('uploadForm');
+
+fileInput.addEventListener('change', function() {
+  if (this.files.length > 0) {
+    const file = this.files[0];
+    const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
+    
+    if (file.size > maxSize) {
+      uploadBtn.disabled = true;
+      fileWarning.style.display = 'block';
+      fileWarning.textContent = '⚠ File too large: ' + fileSizeMB + ' MB (max: """ & $maxSizeMB & """ MB)';
+      fileWarning.style.color = '#ff4444';
+    } else {
+      uploadBtn.disabled = false;
+      fileWarning.style.display = 'block';
+      fileWarning.textContent = '✓ File size: ' + fileSizeMB + ' MB';
+      fileWarning.style.color = '#4da3ff';
+    }
+  } else {
+    uploadBtn.disabled = false;
+    fileWarning.style.display = 'none';
+  }
+});
+
+uploadForm.addEventListener('submit', function(e) {
+  if (uploadBtn.disabled) {
+    e.preventDefault();
+    alert('Please select a file within the size limit.');
+  }
+});
+</script>
 """)
 
   # Add parent directory link if not at root
@@ -173,8 +231,10 @@ proc dirListing(path: string, urlPath: string): string =
 
       content.add(
         "<div class='card parent'>" &
+        "<a href='" & parentPath & "'>" &
         "<span class='icon'>⬆️</span>" &
-        "<a href='" & parentPath & "'>.. (Parent Directory)</a>" &
+        "<span>.. (Parent Directory)</span>" &
+        "</a>" &
         "</div>"
       )
 
@@ -196,8 +256,10 @@ proc dirListing(path: string, urlPath: string): string =
     let encodedName = encodeUrl(name, usePlus = false)
     content.add(
       "<div class='card dir'>" &
+      "<a href='" & prefix & encodedName & "/'>" &
       "<span class='icon'>📁</span>" &
-      "<a href='" & prefix & encodedName & "/'>" & name & "/</a>" &
+      "<span>" & name & "/</span>" &
+      "</a>" &
       "</div>"
     )
 
@@ -205,8 +267,10 @@ proc dirListing(path: string, urlPath: string): string =
     let encodedName = encodeUrl(name, usePlus = false)
     content.add(
       "<div class='card file'>" &
+      "<a href='" & prefix & encodedName & "'>" &
       "<span class='icon'>📄</span>" &
-      "<a href='" & prefix & encodedName & "'>" & name & "</a>" &
+      "<span>" & name & "</span>" &
+      "</a>" &
       "</div>"
     )
 
@@ -216,9 +280,13 @@ proc dirListing(path: string, urlPath: string): string =
 # Upload Handling
 # --------------------------
 
-proc handleUpload(req: Request, path: string) {.async, gcsafe.} =
+proc handleUpload(req: Request, path: string, maxSizeBytes: int): tuple[success: bool, error: string] =
   if req.headers.getOrDefault("Content-Type").startsWith("multipart/form-data"):
     let data = req.body
+
+    # Check size limit
+    if data.len > maxSizeBytes:
+      return (false, "File too large. Maximum size: " & $(maxSizeBytes div (1024 * 1024)) & " MB")
 
     var filename = "upload.bin"
     let lines = data.split("\r\n")
@@ -230,7 +298,8 @@ proc handleUpload(req: Request, path: string) {.async, gcsafe.} =
           let nameEnd = line.find("\"", nameStart)
           if nameEnd != -1:
             filename = line[nameStart ..< nameEnd]
-            if filename == "": return
+            if filename == "":
+              return (false, "No file selected")
             break
 
     let start = data.find("\r\n\r\n")
@@ -244,7 +313,13 @@ proc handleUpload(req: Request, path: string) {.async, gcsafe.} =
 
       if fileData.len > 0 and filename != "" and filename != "upload.bin":
         let fullPath = path / filename
-        writeFile(fullPath, fileData)
+        try:
+          writeFile(fullPath, fileData)
+          return (true, "")
+        except IOError as e:
+          return (false, "Failed to write file: " & e.msg)
+
+  return (false, "Invalid upload request")
 
 # --------------------------
 # MIME type getter
@@ -283,11 +358,13 @@ proc main() =
   var port = 8000
   var host = "0.0.0.0"
   var serveDir = "."
+  var maxSizeMB = 100  # Default 100MB
 
   # State flags for parsing split arguments (e.g., -d ./folder)
   var expectingDir = false
   var expectingPort = false
   var expectingHost = false
+  var expectingMaxSize = false
 
   var p = initOptParser()
   while true:
@@ -296,7 +373,7 @@ proc main() =
     of cmdEnd: break
     of cmdShortOption, cmdLongOption:
       # Reset expectation flags if a new flag is found
-      expectingDir = false; expectingPort = false; expectingHost = false
+      expectingDir = false; expectingPort = false; expectingHost = false; expectingMaxSize = false
 
       case p.key
       of "p", "port":
@@ -308,6 +385,9 @@ proc main() =
       of "d", "dir":
         if p.val.len > 0: serveDir = p.val
         else: expectingDir = true
+      of "m", "max-size":
+        if p.val.len > 0: maxSizeMB = parseInt(p.val)
+        else: expectingMaxSize = true
       of "h", "help":
         showHelp()
       else:
@@ -325,6 +405,9 @@ proc main() =
       elif expectingHost:
         host = p.key
         expectingHost = false
+      elif expectingMaxSize:
+        maxSizeMB = parseInt(p.key)
+        expectingMaxSize = false
       else:
         # If no flag was pending, assume bare arg is the directory
         # This allows: nserve ./waw
@@ -337,6 +420,9 @@ proc main() =
   if not dirExists(serveDir):
     echo "Error: Directory not found: '", serveDir, "'"
     quit(1)
+
+  # Convert MB to bytes
+  let maxSizeBytes = maxSizeMB * 1024 * 1024
 
   # --------------------------
   # Request Callback (Closure)
@@ -364,15 +450,25 @@ proc main() =
           req.hostname
 
     if req.reqMethod == HttpPost and dirExists(fsPath):
-      await handleUpload(req, fsPath)
-      statusCode = Http200
-      logRequest(req.reqMethod, req.url.path, statusCode, clientAddr)
-      await req.respond(
-        statusCode,
-        pageTemplate("Uploaded",
-          "<h2>File uploaded successfully.</h2><a href='" & req.url.path & "'>Back</a>"
+      let (success, error) = handleUpload(req, fsPath, maxSizeBytes)
+      if success:
+        statusCode = Http200
+        logRequest(req.reqMethod, req.url.path, statusCode, clientAddr)
+        await req.respond(
+          statusCode,
+          pageTemplate("Uploaded",
+            "<h2>✓ File uploaded successfully.</h2><a href='" & req.url.path & "'>Back</a>"
+          )
         )
-      )
+      else:
+        statusCode = Http413  # Payload Too Large
+        logRequest(req.reqMethod, req.url.path, statusCode, clientAddr)
+        await req.respond(
+          statusCode,
+          pageTemplate("Upload Failed",
+            "<h2>✗ Upload Failed</h2><p class='error'>" & error & "</p><a href='" & req.url.path & "'>Back</a>"
+          )
+        )
       return
 
     if dirExists(fsPath):
@@ -391,7 +487,7 @@ proc main() =
 
       statusCode = Http200
       logRequest(req.reqMethod, req.url.path, statusCode, clientAddr)
-      await req.respond(statusCode, dirListing(fsPath, req.url.path))
+      await req.respond(statusCode, dirListing(fsPath, req.url.path, maxSizeMB))
 
     elif fileExists(fsPath):
       let (_, _, ext) = splitFile(fsPath)
@@ -423,6 +519,7 @@ proc main() =
   setControlCHook(handleSignal)
 
   echo "Serving directory ", serveDir.absolutePath, " on http://", host, ":", port
+  echo "Max upload size: ", maxSizeMB, " MB"
   echo "Press Ctrl+C to stop"
   echo ""
 
