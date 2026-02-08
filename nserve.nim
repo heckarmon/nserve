@@ -3,6 +3,13 @@ import asynchttpserver, asyncdispatch, os, strutils, uri, parseopt, times, net, 
 const VERSION = "1.0.3"
 
 # --------------------------
+# EMBEDDED JS LIBRARY
+# --------------------------
+# This reads the file at COMPILE TIME and puts it inside the .exe
+# You must have 'qrcode.min.js' in the folder when compiling.
+const QR_LIB = staticRead("static/qrcode.min.js")
+
+# --------------------------
 # Helper / Usage
 # --------------------------
 
@@ -128,8 +135,8 @@ proc pageTemplate(title, body: string): string =
 <html>
 <head>
 <meta charset="utf-8">
-<title>""" & title &
-      """</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>""" & title & """</title>
 <style>
 :root {
   --bg: #ffffff;
@@ -139,6 +146,7 @@ proc pageTemplate(title, body: string): string =
   --file-color: #666666;
   --parent-color: #ff9500;
   --meta-color: #888888;
+  --modal-bg: rgba(0,0,0,0.8);
 }
 body.dark {
   --bg: #121212;
@@ -148,6 +156,7 @@ body.dark {
   --file-color: #aaaaaa;
   --parent-color: #ffb340;
   --meta-color: #999999;
+  --modal-bg: rgba(255,255,255,0.1);
 }
 body {
   background: var(--bg);
@@ -169,42 +178,29 @@ a {
   border-radius: 8px;
   margin-bottom: 8px;
   transition: transform 0.1s;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 .card:hover {
   transform: translateX(4px);
 }
-.card.dir {
-  border-left: 4px solid var(--dir-color);
-}
-.card.file {
-  border-left: 4px solid var(--file-color);
-}
-.card.parent {
-  border-left: 4px solid var(--parent-color);
-  font-weight: bold;
-}
-.icon {
-  font-size: 20px;
-  min-width: 24px;
-}
-.file-info {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-}
-.file-name {
-  font-weight: 500;
-}
-.file-meta {
-  font-size: 0.85em;
-  color: var(--meta-color);
-  margin-top: 2px;
-}
+.card-left { display: flex; align-items: center; gap: 8px; flex: 1; overflow: hidden; }
+.card.dir { border-left: 4px solid var(--dir-color); }
+.card.file { border-left: 4px solid var(--file-color); }
+.card.parent { border-left: 4px solid var(--parent-color); font-weight: bold; }
+.icon { font-size: 20px; min-width: 24px; }
+.file-info { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
+.file-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-meta { font-size: 0.85em; color: var(--meta-color); margin-top: 2px; }
 button { padding: 6px 10px; cursor: pointer; }
-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.qr-btn { 
+  background: none; border: 1px solid var(--meta-color); 
+  color: var(--text); border-radius: 4px; padding: 4px 8px; 
+  font-size: 0.8em; margin-left: 10px; opacity: 0.7; cursor: pointer;
 }
+.qr-btn:hover { opacity: 1; background: var(--card); }
 .error { color: #ff4444; margin-top: 10px; font-weight: bold; }
 .warning { color: #ff9500; margin-top: 5px; font-size: 0.9em; }
 .footer {
@@ -215,12 +211,40 @@ button:disabled {
   opacity: 0.6;
   text-align: center;
 }
+
+/* Modal Styles */
+#qrModal {
+  display: none; position: fixed; z-index: 1000; left: 0; top: 0;
+  width: 100%; height: 100%; background-color: var(--modal-bg);
+  align-items: center; justify-content: center;
+}
+.modal-content {
+  background-color: #fff; padding: 20px; border-radius: 10px;
+  text-align: center; max-width: 300px;
+  box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+}
+#qrPlaceholder { display: flex; justify-content: center; margin: 10px 0; }
+.modal-close { margin-top: 10px; width: 100%; padding: 10px 0; background: #eee; border: none; border-radius: 5px; cursor: pointer; color: #000; }
 </style>
 </head>
 <body>
 <button onclick="toggleTheme()">Toggle Theme</button>
 """ & body & """
 <div class="footer">nserve v""" & VERSION & """</div>
+
+<div id="qrModal" onclick="closeQR()">
+  <div class="modal-content" onclick="event.stopPropagation()">
+    <h3 style="color:#000; margin-top:0;">Scan to Download</h3>
+    <div id="qrPlaceholder"></div>
+    <div id="qrLink" style="font-size:0.75em; color:#555; word-break:break-all;"></div>
+    <button class="modal-close" onclick="closeQR()">Close</button>
+  </div>
+</div>
+
+<script>
+""" & QR_LIB & """
+</script>
+
 <script>
 // Load theme from localStorage on page load
 if (localStorage.getItem('theme') === 'dark') {
@@ -236,6 +260,36 @@ function toggleTheme() {
     localStorage.setItem('theme', 'light');
   }
 }
+
+// QR Code Logic
+function showQR(path) {
+  const fullUrl = window.location.protocol + "//" + window.location.host + path;
+  
+  // Clear previous QR
+  document.getElementById("qrPlaceholder").innerHTML = "";
+  document.getElementById("qrLink").innerText = fullUrl;
+  
+  // Generate Offline QR
+  new QRCode(document.getElementById("qrPlaceholder"), {
+    text: fullUrl,
+    width: 200,
+    height: 200,
+    colorDark : "#000000",
+    colorLight : "#ffffff",
+    correctLevel : QRCode.CorrectLevel.M
+  });
+  
+  document.getElementById('qrModal').style.display = "flex";
+}
+
+function closeQR() {
+  document.getElementById('qrModal').style.display = "none";
+}
+
+// Close on Escape
+document.addEventListener('keydown', function(event) {
+  if (event.key === "Escape") closeQR();
+});
 </script>
 </body>
 </html>
@@ -311,13 +365,14 @@ uploadForm.addEventListener('submit', function(e) {
 
       content.add(
         "<div class='card parent'>" &
+        "<div class='card-left'>" &
         "<a href='" & parentPath & "'>" &
         "<span class='icon'>⬆️</span>" &
         "<div class='file-info'>" &
         "<span class='file-name'>.. (Parent Directory)</span>" &
         "</div>" &
         "</a>" &
-        "</div>"
+        "</div></div>"
       )
 
   # Collect directories and files with metadata
@@ -364,6 +419,7 @@ uploadForm.addEventListener('submit', function(e) {
     
     content.add(
       "<div class='card dir'>" &
+      "<div class='card-left'>" &
       "<a href='" & prefix & encodedName & "/'>" &
       "<span class='icon'>📁</span>" &
       "<div class='file-info'>" &
@@ -371,24 +427,28 @@ uploadForm.addEventListener('submit', function(e) {
       "<span class='file-meta'>" & timeAgo & "</span>" &
       "</div>" &
       "</a>" &
-      "</div>"
+      "</div></div>"
     )
 
-  # Display files
+  # Display files (WITH QR BUTTON)
   for entry in files:
     let encodedName = encodeUrl(entry.name, usePlus = false)
     let sizeStr = formatFileSize(entry.size)
     let timeAgo = formatTimeAgo(entry.modTime)
+    let fileUrl = prefix & encodedName
     
     content.add(
       "<div class='card file'>" &
-      "<a href='" & prefix & encodedName & "'>" &
+      "<div class='card-left'>" &
+      "<a href='" & fileUrl & "'>" &
       "<span class='icon'>📄</span>" &
       "<div class='file-info'>" &
       "<span class='file-name'>" & entry.name & "</span>" &
       "<span class='file-meta'>" & sizeStr & " • " & timeAgo & "</span>" &
       "</div>" &
       "</a>" &
+      "</div>" &
+      "<button class='qr-btn' onclick=\"showQR('" & fileUrl & "')\">📱 QR</button>" &
       "</div>"
     )
 

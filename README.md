@@ -1,14 +1,18 @@
-# NServe: A Simple HTTP Nim File Server 🚀
+# NServe: A lightweight zero-deps, async HTTP file server with uploads 🚀
 
 > A lightweight, blazingly fast HTTP file server written in Nim with a modern dark/light theme UI and colored request logging. **Zero runtime dependencies** - just a single executable!
 
-![NServe UI Sneak Peek](nserve_sneak.png)
+| UI Preview | QR Code Feature |
+| :---: | :---: |
+| ![NServe UI](images/nserve_ui.png) | ![NServe QR](images/nserve_qr.png) |
 
 ## Features ✨
 
 - 📁 **Directory Browsing** - Clean, organized listing with folders and files separated
 - ⬆️ **Parent Navigation** - Easy navigation back to parent directories
 - 📤 **File Upload** - Simple file uploads to any directory
+- 🛑 **Upload Limits** - Configurable maximum file size limit (default 100MB) to prevent server overload
+- 📱 **QR Code Sharing** - Instant offline QR code generation for sharing files to mobile devices
 - 🎨 **Theme Toggle** - Dark/light mode with persistent preferences using localStorage
 - 📊 **Detailed Logging** - Color-coded logs with timestamps and **real client IP/Port tracking**
 - 🔧 **Configurable** - Custom host and port via CLI arguments
@@ -18,6 +22,15 @@
 - 🪶 **Lightweight** - Minimal memory footprint, no external libraries needed
 
 ## Installation 📦
+
+### Via Nimble (Recommended)
+Since nserve is published on the official Nim package registry, you can install it with a single command:
+
+```bash
+nimble install nserve
+```
+
+This will compile nserve and place the binary in your ~/.nimble/bin folder. Make sure that folder is in your system PATH.
 
 ### Prerequisites
 
