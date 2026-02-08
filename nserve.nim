@@ -1,12 +1,14 @@
 import asynchttpserver, asyncdispatch, os, strutils, uri, parseopt, times, net, asyncnet
 
+const VERSION = "1.0.3"
+
 # --------------------------
 # Helper / Usage
 # --------------------------
 
 proc showHelp() =
   echo """
-nserve - A lightweight Async HTTP File Server
+nserve v""" & VERSION & """ - A lightweight Async HTTP File Server
 
 Usage:
   nserve [options] [directory]
@@ -16,6 +18,7 @@ Options:
   -H, --host        Set the host address (default: 0.0.0.0)
   -d, --dir         Set the directory to serve (default: current dir)
   -m, --max-size    Set max upload size in MB (default: 100)
+  -v, --version     Show version information
   -h, --help        Show this help message
 
 Syntax Notes:
@@ -29,8 +32,61 @@ Examples:
   nserve --dir=/var/www       # Long options
   nserve -m 500               # Allow uploads up to 500MB
   nserve --max-size=1024      # Allow uploads up to 1GB
+
+Upload via CLI (curl):
+  curl -F "file=@document.pdf" http://localhost:8000/path/to/dir/
+  curl -F "file=@image.png" http://192.168.1.100:8080/uploads/
 """
   quit(0)
+
+proc showVersion() =
+  echo "nserve v", VERSION
+  echo "A lightweight Async HTTP File Server"
+  echo "Built with Nim - Zero runtime dependencies"
+  quit(0)
+
+# --------------------------
+# Utility Functions
+# --------------------------
+
+proc formatFileSize(bytes: int64): string =
+  ## Format bytes into human-readable size
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  var size = bytes.float
+  var unitIndex = 0
+  
+  while size >= 1024.0 and unitIndex < units.high:
+    size = size / 1024.0
+    inc unitIndex
+  
+  if unitIndex == 0:
+    result = $bytes & " " & units[0]
+  else:
+    result = size.formatFloat(ffDecimal, 1) & " " & units[unitIndex]
+
+proc formatTimeAgo(modTime: Time): string =
+  ## Format time as relative "X ago" string
+  let now = getTime()
+  let diff = now - modTime
+  let seconds = diff.inSeconds
+  
+  if seconds < 60:
+    result = $seconds & " sec ago"
+  elif seconds < 3600:
+    let mins = seconds div 60
+    result = $mins & " min ago"
+  elif seconds < 86400:
+    let hours = seconds div 3600
+    result = $hours & " hour" & (if hours > 1: "s" else: "") & " ago"
+  elif seconds < 2592000:  # 30 days
+    let days = seconds div 86400
+    result = $days & " day" & (if days > 1: "s" else: "") & " ago"
+  elif seconds < 31536000:  # 365 days
+    let months = seconds div 2592000
+    result = $months & " month" & (if months > 1: "s" else: "") & " ago"
+  else:
+    let years = seconds div 31536000
+    result = $years & " year" & (if years > 1: "s" else: "") & " ago"
 
 # --------------------------
 # Logging
@@ -82,6 +138,7 @@ proc pageTemplate(title, body: string): string =
   --dir-color: #4da3ff;
   --file-color: #666666;
   --parent-color: #ff9500;
+  --meta-color: #888888;
 }
 body.dark {
   --bg: #121212;
@@ -90,6 +147,7 @@ body.dark {
   --dir-color: #6db3ff;
   --file-color: #aaaaaa;
   --parent-color: #ffb340;
+  --meta-color: #999999;
 }
 body {
   background: var(--bg);
@@ -129,6 +187,19 @@ a {
   font-size: 20px;
   min-width: 24px;
 }
+.file-info {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+.file-name {
+  font-weight: 500;
+}
+.file-meta {
+  font-size: 0.85em;
+  color: var(--meta-color);
+  margin-top: 2px;
+}
 button { padding: 6px 10px; cursor: pointer; }
 button:disabled {
   opacity: 0.5;
@@ -136,11 +207,20 @@ button:disabled {
 }
 .error { color: #ff4444; margin-top: 10px; font-weight: bold; }
 .warning { color: #ff9500; margin-top: 5px; font-size: 0.9em; }
+.footer {
+  margin-top: 40px;
+  padding-top: 20px;
+  border-top: 1px solid var(--card);
+  font-size: 0.85em;
+  opacity: 0.6;
+  text-align: center;
+}
 </style>
 </head>
 <body>
 <button onclick="toggleTheme()">Toggle Theme</button>
 """ & body & """
+<div class="footer">nserve v""" & VERSION & """</div>
 <script>
 // Load theme from localStorage on page load
 if (localStorage.getItem('theme') === 'dark') {
@@ -233,43 +313,81 @@ uploadForm.addEventListener('submit', function(e) {
         "<div class='card parent'>" &
         "<a href='" & parentPath & "'>" &
         "<span class='icon'>⬆️</span>" &
-        "<span>.. (Parent Directory)</span>" &
+        "<div class='file-info'>" &
+        "<span class='file-name'>.. (Parent Directory)</span>" &
+        "</div>" &
         "</a>" &
         "</div>"
       )
 
-  var dirs: seq[string] = @[]
-  var files: seq[string] = @[]
+  # Collect directories and files with metadata
+  type FileEntry = object
+    name: string
+    isDir: bool
+    size: int64
+    modTime: Time
 
-  for kind, file in walkDir(path):
-    let name = extractFilename(file)
-    if kind == pcDir:
-      dirs.add(name)
+  var entries: seq[FileEntry] = @[]
+
+  for kind, filePath in walkDir(path):
+    let name = extractFilename(filePath)
+    var entry = FileEntry(name: name, isDir: kind == pcDir)
+    
+    try:
+      let info = getFileInfo(filePath)
+      entry.size = info.size
+      entry.modTime = info.lastWriteTime
+    except:
+      entry.size = 0
+      entry.modTime = getTime()
+    
+    entries.add(entry)
+
+  # Separate and sort
+  var dirs: seq[FileEntry] = @[]
+  var files: seq[FileEntry] = @[]
+  
+  for entry in entries:
+    if entry.isDir:
+      dirs.add(entry)
     else:
-      files.add(name)
+      files.add(entry)
 
   var prefix = urlPath
   if not prefix.endsWith("/"):
     prefix &= "/"
 
-  for name in dirs:
-    let encodedName = encodeUrl(name, usePlus = false)
+  # Display directories
+  for entry in dirs:
+    let encodedName = encodeUrl(entry.name, usePlus = false)
+    let timeAgo = formatTimeAgo(entry.modTime)
+    
     content.add(
       "<div class='card dir'>" &
       "<a href='" & prefix & encodedName & "/'>" &
       "<span class='icon'>📁</span>" &
-      "<span>" & name & "/</span>" &
+      "<div class='file-info'>" &
+      "<span class='file-name'>" & entry.name & "/</span>" &
+      "<span class='file-meta'>" & timeAgo & "</span>" &
+      "</div>" &
       "</a>" &
       "</div>"
     )
 
-  for name in files:
-    let encodedName = encodeUrl(name, usePlus = false)
+  # Display files
+  for entry in files:
+    let encodedName = encodeUrl(entry.name, usePlus = false)
+    let sizeStr = formatFileSize(entry.size)
+    let timeAgo = formatTimeAgo(entry.modTime)
+    
     content.add(
       "<div class='card file'>" &
       "<a href='" & prefix & encodedName & "'>" &
       "<span class='icon'>📄</span>" &
-      "<span>" & name & "</span>" &
+      "<div class='file-info'>" &
+      "<span class='file-name'>" & entry.name & "</span>" &
+      "<span class='file-meta'>" & sizeStr & " • " & timeAgo & "</span>" &
+      "</div>" &
       "</a>" &
       "</div>"
     )
@@ -388,6 +506,8 @@ proc main() =
       of "m", "max-size":
         if p.val.len > 0: maxSizeMB = parseInt(p.val)
         else: expectingMaxSize = true
+      of "v", "version":
+        showVersion()
       of "h", "help":
         showHelp()
       else:
@@ -518,6 +638,7 @@ proc main() =
     quit(0)
   setControlCHook(handleSignal)
 
+  echo "nserve v", VERSION
   echo "Serving directory ", serveDir.absolutePath, " on http://", host, ":", port
   echo "Max upload size: ", maxSizeMB, " MB"
   echo "Press Ctrl+C to stop"
