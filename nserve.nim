@@ -1,129 +1,185 @@
-import asynchttpserver, asyncdispatch, os, strutils, uri, parseopt, times, net, asyncnet
+import asynchttpserver, asyncdispatch, os, strutils, uri, parseopt, times, net
+import streams
 
-const VERSION = "1.0.3"
+const VERSION = "1.0.4"
 
 # --------------------------
 # EMBEDDED JS LIBRARY
 # --------------------------
-# This reads the file at COMPILE TIME and puts it inside the .exe
-# You must have 'qrcode.min.js' in the folder when compiling.
 const QR_LIB = staticRead("static/qrcode.min.js")
 
 # --------------------------
-# Helper / Usage
+# ZIP Implementation (Zero Dependency)
 # --------------------------
 
+type
+  ZipFileEntry = object
+    name: string
+    data: string
+    crc32: uint32
+    uncompressedSize: uint32
+    compressedSize: uint32
+    localHeaderOffset: uint32
+
+proc crc32(data: string): uint32 =
+  const crcTable = block:
+    var table: array[256, uint32]
+    for i in 0..255:
+      var c = uint32(i)
+      for j in 0..7:
+        if (c and 1) != 0: c = 0xEDB88320'u32 xor (c shr 1)
+        else: c = c shr 1
+      table[i] = c
+    table
+
+  var crc = 0xFFFFFFFF'u32
+  for b in data:
+    crc = crcTable[int((crc xor uint32(b)) and 0xFF)] xor (crc shr 8)
+  return not crc
+
+proc writeUint16LE(s: Stream, val: uint16) = s.write(val)
+proc writeUint32LE(s: Stream, val: uint32) = s.write(val)
+
+proc createZipFile(files: var seq[ZipFileEntry]): string =
+  var zipStream = newStringStream()
+  var centralDir = newStringStream()
+
+  for i in 0..<files.len:
+    files[i].localHeaderOffset = uint32(zipStream.getPosition())
+
+    # Local File Header
+    zipStream.writeUint32LE(0x04034b50'u32)
+    zipStream.writeUint16LE(20)
+    zipStream.writeUint16LE(0)
+    zipStream.writeUint16LE(0) # No compression (Stored)
+    zipStream.writeUint16LE(0)
+    zipStream.writeUint16LE(0)
+    zipStream.writeUint32LE(files[i].crc32)
+    zipStream.writeUint32LE(files[i].compressedSize)
+    zipStream.writeUint32LE(files[i].uncompressedSize)
+    zipStream.writeUint16LE(uint16(files[i].name.len))
+    zipStream.writeUint16LE(0)
+
+    zipStream.write(files[i].name)
+    zipStream.write(files[i].data)
+
+    # Central Directory Header
+    centralDir.writeUint32LE(0x02014b50'u32)
+    centralDir.writeUint16LE(20)
+    centralDir.writeUint16LE(20)
+    centralDir.writeUint16LE(0)
+    centralDir.writeUint16LE(0)
+    centralDir.writeUint16LE(0)
+    centralDir.writeUint16LE(0)
+    centralDir.writeUint32LE(files[i].crc32)
+    centralDir.writeUint32LE(files[i].compressedSize)
+    centralDir.writeUint32LE(files[i].uncompressedSize)
+    centralDir.writeUint16LE(uint16(files[i].name.len))
+    centralDir.writeUint16LE(0)
+    centralDir.writeUint16LE(0)
+    centralDir.writeUint16LE(0)
+    centralDir.writeUint16LE(0)
+    centralDir.writeUint32LE(0)
+    centralDir.writeUint32LE(files[i].localHeaderOffset)
+
+    centralDir.write(files[i].name)
+
+  let centralDirOffset = uint32(zipStream.getPosition())
+  let centralDirSize = uint32(centralDir.getPosition())
+
+  centralDir.setPosition(0)
+  zipStream.write(centralDir.readAll())
+
+  # End of Central Directory
+  zipStream.writeUint32LE(0x06054b50'u32)
+  zipStream.writeUint16LE(0)
+  zipStream.writeUint16LE(0)
+  zipStream.writeUint16LE(uint16(files.len))
+  zipStream.writeUint16LE(uint16(files.len))
+  zipStream.writeUint32LE(centralDirSize)
+  zipStream.writeUint32LE(centralDirOffset)
+  zipStream.writeUint16LE(0)
+
+  zipStream.setPosition(0)
+  return zipStream.readAll()
+
+proc zipDirectory(dirPath: string): string =
+  var entries: seq[ZipFileEntry] = @[]
+  # Ensure base path does not have trailing slash for consistent replacement
+  let basePath = if dirPath.endsWith($DirSep): dirPath[0 ..< ^1] else: dirPath
+
+  # FIX: walkDirRec only yields 'path', not 'kind, path'
+  for path in walkDirRec(dirPath, yieldFilter = {pcFile}):
+
+    # Calculate relative path inside ZIP
+    # We use basePath location to slice the string
+    # We add 1 to length to skip the slash separator
+    var relativePath = path[basePath.len+1 .. ^1]
+
+    # Standardize to forward slashes for ZIP spec (Windows fix)
+    relativePath = relativePath.replace('\\', '/')
+
+    let fileData = readFile(path)
+
+    entries.add(ZipFileEntry(
+      name: relativePath,
+      data: fileData,
+      crc32: crc32(fileData),
+      uncompressedSize: uint32(fileData.len),
+      compressedSize: uint32(fileData.len)
+    ))
+
+  return createZipFile(entries)
+
+# --------------------------
+# Helpers & UI
+# --------------------------
+
+proc formatFileSize(bytes: int64): string =
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  var size = bytes.float
+  var unitIndex = 0
+  while size >= 1024.0 and unitIndex < units.high:
+    size = size / 1024.0
+    inc unitIndex
+  if unitIndex == 0: result = $bytes & " " & units[0]
+  else: result = size.formatFloat(ffDecimal, 1) & " " & units[unitIndex]
+
+proc formatTimeAgo(modTime: Time): string =
+  let now = getTime()
+  let diff = now - modTime
+  let seconds = diff.inSeconds
+  if seconds < 60: result = $seconds & " sec ago"
+  elif seconds < 3600: result = $(seconds div 60) & " min ago"
+  elif seconds < 86400: result = $(seconds div 3600) & " hours ago"
+  else: result = $(seconds div 86400) & " days ago"
+
 proc showHelp() =
-  echo """
-nserve v""" & VERSION & """ - A lightweight Async HTTP File Server
-
-Usage:
-  nserve [options] [directory]
-
-Options:
-  -p, --port        Set the port (default: 8000)
-  -H, --host        Set the host address (default: 0.0.0.0)
-  -d, --dir         Set the directory to serve (default: current dir)
-  -m, --max-size    Set max upload size in MB (default: 100)
-  -v, --version     Show version information
-  -h, --help        Show this help message
-
-Syntax Notes:
-  • Short flags (-d, -p) use space or colon:   -d ./waw  OR  -d:./waw
-  • Long flags (--dir) use equals or colon:    --dir=./waw
-
-Examples:
-  nserve ./waw                # Serve directory directly (Recommended)
-  nserve -p 8080              # Serve current dir on port 8080
-  nserve -d:./html -p:3000    # Short options with colons
-  nserve --dir=/var/www       # Long options
-  nserve -m 500               # Allow uploads up to 500MB
-  nserve --max-size=1024      # Allow uploads up to 1GB
-
-Upload via CLI (curl):
-  curl -F "file=@document.pdf" http://localhost:8000/path/to/dir/
-  curl -F "file=@image.png" http://192.168.1.100:8080/uploads/
-"""
+  echo """nserve v""" & VERSION & """
+Usage: nserve [options] [directory]
+  -p, --port      Port (8000)
+  -H, --host      Host (0.0.0.0)
+  -d, --dir       Directory (.)
+  -m, --max-size  Max upload MB (100)"""
   quit(0)
 
 proc showVersion() =
   echo "nserve v", VERSION
-  echo "A lightweight Async HTTP File Server"
-  echo "Built with Nim - Zero runtime dependencies"
   quit(0)
-
-# --------------------------
-# Utility Functions
-# --------------------------
-
-proc formatFileSize(bytes: int64): string =
-  ## Format bytes into human-readable size
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  var size = bytes.float
-  var unitIndex = 0
-  
-  while size >= 1024.0 and unitIndex < units.high:
-    size = size / 1024.0
-    inc unitIndex
-  
-  if unitIndex == 0:
-    result = $bytes & " " & units[0]
-  else:
-    result = size.formatFloat(ffDecimal, 1) & " " & units[unitIndex]
-
-proc formatTimeAgo(modTime: Time): string =
-  ## Format time as relative "X ago" string
-  let now = getTime()
-  let diff = now - modTime
-  let seconds = diff.inSeconds
-  
-  if seconds < 60:
-    result = $seconds & " sec ago"
-  elif seconds < 3600:
-    let mins = seconds div 60
-    result = $mins & " min ago"
-  elif seconds < 86400:
-    let hours = seconds div 3600
-    result = $hours & " hour" & (if hours > 1: "s" else: "") & " ago"
-  elif seconds < 2592000:  # 30 days
-    let days = seconds div 86400
-    result = $days & " day" & (if days > 1: "s" else: "") & " ago"
-  elif seconds < 31536000:  # 365 days
-    let months = seconds div 2592000
-    result = $months & " month" & (if months > 1: "s" else: "") & " ago"
-  else:
-    let years = seconds div 31536000
-    result = $years & " year" & (if years > 1: "s" else: "") & " ago"
-
-# --------------------------
-# Logging
-# --------------------------
 
 proc logRequest(reqMethod: HttpMethod, path: string, statusCode: HttpCode,
     clientAddr: string) =
   let timestamp = now().format("yyyy-MM-dd HH:mm:ss")
-  let methodStr = $reqMethod
-  let statusStr = $statusCode.int
-
-  # Color codes for terminal output
+  let statusInt = statusCode.int
   let methodColor = case reqMethod
     of HttpGet: "\e[32m"
     of HttpPost: "\e[33m"
-    of HttpPut: "\e[34m"
-    of HttpDelete: "\e[31m"
     else: "\e[37m"
-
-  let statusInt = statusCode.int
-  let statusColor = if statusInt >= 200 and statusInt < 300: "\e[32m"
-    elif statusInt >= 300 and statusInt < 400: "\e[36m"
-    elif statusInt >= 400 and statusInt < 500: "\e[33m"
-    else: "\e[31m"
-
-  let reset = "\e[0m"
-
-  echo "[", timestamp, "] ", "\e[36m", clientAddr.alignLeft(21), reset, " ",
-       methodColor, methodStr.alignLeft(7), reset,
-       " ", statusColor, statusStr, reset, " ", path
+  let statusColor = if statusInt < 300: "\e[32m" elif statusInt <
+      400: "\e[36m" else: "\e[31m"
+  echo "[", timestamp, "] ", "\e[36m", clientAddr.alignLeft(21), "\e[0m ",
+       methodColor, ($reqMethod).alignLeft(7), "\e[0m ",
+       " ", statusColor, $statusInt, "\e[0m ", " ", path
 
 # --------------------------
 # HTML Template
@@ -136,368 +192,153 @@ proc pageTemplate(title, body: string): string =
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>""" & title & """</title>
+<title>""" & title &
+      """</title>
 <style>
-:root {
-  --bg: #ffffff;
-  --text: #111111;
-  --card: #f4f4f4;
-  --dir-color: #4da3ff;
-  --file-color: #666666;
-  --parent-color: #ff9500;
-  --meta-color: #888888;
-  --modal-bg: rgba(0,0,0,0.8);
-}
-body.dark {
-  --bg: #121212;
-  --text: #eeeeee;
-  --card: #1e1e1e;
-  --dir-color: #6db3ff;
-  --file-color: #aaaaaa;
-  --parent-color: #ffb340;
-  --meta-color: #999999;
-  --modal-bg: rgba(255,255,255,0.1);
-}
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: sans-serif;
-  padding: 20px;
-}
-a {
-  color: inherit;
-  text-decoration: none;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-}
-.card {
-  background: var(--card);
-  padding: 12px;
-  border-radius: 8px;
-  margin-bottom: 8px;
-  transition: transform 0.1s;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.card:hover {
-  transform: translateX(4px);
-}
+:root { --bg: #fff; --text: #111; --card: #f4f4f4; --dir: #4da3ff; --file: #666; --meta: #888; --modal: rgba(0,0,0,0.8); }
+body.dark { --bg: #121212; --text: #eee; --card: #1e1e1e; --dir: #6db3ff; --file: #aaa; --meta: #999; --modal: rgba(255,255,255,0.1); }
+body { background: var(--bg); color: var(--text); font-family: sans-serif; padding: 20px; }
+a { color: inherit; text-decoration: none; display: flex; align-items: center; gap: 8px; width: 100%; }
+.card { background: var(--card); padding: 12px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+.card:hover { transform: translateX(4px); transition: 0.1s; }
 .card-left { display: flex; align-items: center; gap: 8px; flex: 1; overflow: hidden; }
-.card.dir { border-left: 4px solid var(--dir-color); }
-.card.file { border-left: 4px solid var(--file-color); }
-.card.parent { border-left: 4px solid var(--parent-color); font-weight: bold; }
+.card.dir { border-left: 4px solid var(--dir); }
+.card.file { border-left: 4px solid var(--file); }
 .icon { font-size: 20px; min-width: 24px; }
 .file-info { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
-.file-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.file-meta { font-size: 0.85em; color: var(--meta-color); margin-top: 2px; }
-button { padding: 6px 10px; cursor: pointer; }
-button:disabled { opacity: 0.5; cursor: not-allowed; }
-.qr-btn { 
-  background: none; border: 1px solid var(--meta-color); 
-  color: var(--text); border-radius: 4px; padding: 4px 8px; 
-  font-size: 0.8em; margin-left: 10px; opacity: 0.7; cursor: pointer;
-}
-.qr-btn:hover { opacity: 1; background: var(--card); }
-.error { color: #ff4444; margin-top: 10px; font-weight: bold; }
-.warning { color: #ff9500; margin-top: 5px; font-size: 0.9em; }
-.footer {
-  margin-top: 40px;
-  padding-top: 20px;
-  border-top: 1px solid var(--card);
-  font-size: 0.85em;
-  opacity: 0.6;
-  text-align: center;
-}
-
-/* Modal Styles */
-#qrModal {
-  display: none; position: fixed; z-index: 1000; left: 0; top: 0;
-  width: 100%; height: 100%; background-color: var(--modal-bg);
-  align-items: center; justify-content: center;
-}
-.modal-content {
-  background-color: #fff; padding: 20px; border-radius: 10px;
-  text-align: center; max-width: 300px;
-  box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-}
-#qrPlaceholder { display: flex; justify-content: center; margin: 10px 0; }
-.modal-close { margin-top: 10px; width: 100%; padding: 10px 0; background: #eee; border: none; border-radius: 5px; cursor: pointer; color: #000; }
+.file-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-meta { font-size: 0.85em; color: var(--meta); }
+.btn { padding: 4px 8px; border-radius: 4px; cursor: pointer; border: 1px solid var(--meta); background: none; color: var(--text); font-size: 0.8em; margin-left: 5px; opacity: 0.7; }
+.btn:hover { opacity: 1; background: var(--card); }
+#qrModal { display: none; position: fixed; inset: 0; background: var(--modal); align-items: center; justify-content: center; z-index: 1000; }
+.modal-content { background: #fff; padding: 20px; border-radius: 10px; text-align: center; max-width: 300px; color: #000; }
 </style>
 </head>
 <body>
-<button onclick="toggleTheme()">Toggle Theme</button>
-""" & body & """
-<div class="footer">nserve v""" & VERSION & """</div>
+<button onclick="toggleTheme()" style="padding:6px 10px; cursor:pointer;">Toggle Theme</button>
+""" & body &
+      """
+<div style="margin-top:40px; text-align:center; opacity:0.6; font-size:0.8em; border-top:1px solid #ccc; padding-top:20px;">nserve v""" &
+      VERSION &
+      """</div>
 
 <div id="qrModal" onclick="closeQR()">
   <div class="modal-content" onclick="event.stopPropagation()">
-    <h3 style="color:#000; margin-top:0;">Scan to Download</h3>
-    <div id="qrPlaceholder"></div>
-    <div id="qrLink" style="font-size:0.75em; color:#555; word-break:break-all;"></div>
-    <button class="modal-close" onclick="closeQR()">Close</button>
+    <h3>Scan to Download</h3>
+    <div id="qrPlaceholder" style="display:flex; justify-content:center; margin:10px 0;"></div>
+    <div id="qrLink" style="font-size:0.75em; word-break:break-all; color:#555;"></div>
+    <button class="btn" style="width:100%; margin-top:10px; background:#eee; color:#000;" onclick="closeQR()">Close</button>
   </div>
 </div>
 
 <script>
 """ & QR_LIB & """
 </script>
-
 <script>
-// Load theme from localStorage on page load
-if (localStorage.getItem('theme') === 'dark') {
-  document.body.classList.add('dark');
-}
-
+if (localStorage.getItem('theme') === 'dark') document.body.classList.add('dark');
 function toggleTheme() {
   document.body.classList.toggle('dark');
-  // Save theme preference to localStorage
-  if (document.body.classList.contains('dark')) {
-    localStorage.setItem('theme', 'dark');
-  } else {
-    localStorage.setItem('theme', 'light');
-  }
+  localStorage.setItem('theme', document.body.classList.contains('dark') ? 'dark' : 'light');
 }
-
-// QR Code Logic
 function showQR(path) {
   const fullUrl = window.location.protocol + "//" + window.location.host + path;
-  
-  // Clear previous QR
   document.getElementById("qrPlaceholder").innerHTML = "";
   document.getElementById("qrLink").innerText = fullUrl;
-  
-  // Generate Offline QR
-  new QRCode(document.getElementById("qrPlaceholder"), {
-    text: fullUrl,
-    width: 200,
-    height: 200,
-    colorDark : "#000000",
-    colorLight : "#ffffff",
-    correctLevel : QRCode.CorrectLevel.M
-  });
-  
+  new QRCode(document.getElementById("qrPlaceholder"), { text: fullUrl, width: 200, height: 200 });
   document.getElementById('qrModal').style.display = "flex";
 }
-
-function closeQR() {
-  document.getElementById('qrModal').style.display = "none";
-}
-
-// Close on Escape
-document.addEventListener('keydown', function(event) {
-  if (event.key === "Escape") closeQR();
-});
+function closeQR() { document.getElementById('qrModal').style.display = "none"; }
+document.addEventListener('keydown', (e) => { if (e.key === "Escape") closeQR(); });
 </script>
 </body>
 </html>
 """
 
 # --------------------------
-# Directory Listing
+# Directory Logic
 # --------------------------
 
 proc dirListing(path: string, urlPath: string, maxSizeMB: int): string =
   var content = "<h1>Index of " & urlPath & "</h1>"
+  let maxBytes = maxSizeMB * 1024 * 1024
 
-  let maxSizeBytes = maxSizeMB * 1024 * 1024
-  
   content.add("""
-<form method="POST" enctype="multipart/form-data" id="uploadForm">
-  <input type="file" name="file" id="fileInput">
-  <button type="submit" id="uploadBtn">Upload</button>
-  <span style="margin-left: 10px; font-size: 0.9em; opacity: 0.7;">Max: """ & $maxSizeMB & """ MB</span>
-  <div id="fileWarning" class="warning" style="display: none;"></div>
+<form method="POST" enctype="multipart/form-data" id="uForm">
+  <input type="file" name="file" id="fIn">
+  <button type="submit" id="uBtn">Upload</button>
+  <span style="font-size:0.8em; margin-left:5px;">Max: """ & $maxSizeMB &
+      """MB</span>
+  <div id="fWarn" style="display:none; font-weight:bold; margin-top:5px;"></div>
 </form>
 <hr>
-
 <script>
-const maxSize = """ & $maxSizeBytes & """;
-const fileInput = document.getElementById('fileInput');
-const uploadBtn = document.getElementById('uploadBtn');
-const fileWarning = document.getElementById('fileWarning');
-const uploadForm = document.getElementById('uploadForm');
-
-fileInput.addEventListener('change', function() {
+const max = """ & $maxBytes & """;
+const fIn = document.getElementById('fIn');
+const uBtn = document.getElementById('uBtn');
+const fWarn = document.getElementById('fWarn');
+fIn.addEventListener('change', function() {
   if (this.files.length > 0) {
-    const file = this.files[0];
-    const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
-    
-    if (file.size > maxSize) {
-      uploadBtn.disabled = true;
-      fileWarning.style.display = 'block';
-      fileWarning.textContent = '⚠ File too large: ' + fileSizeMB + ' MB (max: """ & $maxSizeMB & """ MB)';
-      fileWarning.style.color = '#ff4444';
+    const sz = this.files[0].size;
+    const mb = (sz/1048576).toFixed(2);
+    if (sz > max) {
+       uBtn.disabled = true; fWarn.style.display='block'; fWarn.style.color='red'; fWarn.textContent='⚠ Too large: '+mb+'MB';
     } else {
-      uploadBtn.disabled = false;
-      fileWarning.style.display = 'block';
-      fileWarning.textContent = '✓ File size: ' + fileSizeMB + ' MB';
-      fileWarning.style.color = '#4da3ff';
+       uBtn.disabled = false; fWarn.style.display='block'; fWarn.style.color='green'; fWarn.textContent='✓ '+mb+'MB';
     }
-  } else {
-    uploadBtn.disabled = false;
-    fileWarning.style.display = 'none';
-  }
-});
-
-uploadForm.addEventListener('submit', function(e) {
-  if (uploadBtn.disabled) {
-    e.preventDefault();
-    alert('Please select a file within the size limit.');
   }
 });
 </script>
 """)
 
-  # Add parent directory link if not at root
   if urlPath != "/":
-    var parentPath = urlPath
-    if parentPath.endsWith("/"):
-      parentPath = parentPath[0 ..< parentPath.len - 1]
+    var pPath = urlPath
+    if pPath.endsWith("/"): pPath = pPath[0 ..< ^1]
+    let slash = pPath.rfind('/')
+    if slash >= 0: pPath = pPath[0 ..< slash]
+    if pPath == "": pPath = "/"
+    content.add("<div class='card parent'><div class='card-left'><a href='" &
+        pPath & "'><span class='icon'>⬆️</span><span>.. (Parent)</span></a></div></div>")
 
-    let lastSlash = parentPath.rfind('/')
-    if lastSlash >= 0:
-      parentPath = parentPath[0 ..< lastSlash]
-      if parentPath == "":
-        parentPath = "/"
+  var dirs: seq[tuple[name: string, time: Time]] = @[]
+  var files: seq[tuple[name: string, size: int64, time: Time]] = @[]
 
-      content.add(
-        "<div class='card parent'>" &
-        "<div class='card-left'>" &
-        "<a href='" & parentPath & "'>" &
-        "<span class='icon'>⬆️</span>" &
-        "<div class='file-info'>" &
-        "<span class='file-name'>.. (Parent Directory)</span>" &
-        "</div>" &
-        "</a>" &
-        "</div></div>"
-      )
-
-  # Collect directories and files with metadata
-  type FileEntry = object
-    name: string
-    isDir: bool
-    size: int64
-    modTime: Time
-
-  var entries: seq[FileEntry] = @[]
-
-  for kind, filePath in walkDir(path):
-    let name = extractFilename(filePath)
-    var entry = FileEntry(name: name, isDir: kind == pcDir)
-    
+  for kind, p in walkDir(path):
+    let n = extractFilename(p)
     try:
-      let info = getFileInfo(filePath)
-      entry.size = info.size
-      entry.modTime = info.lastWriteTime
-    except:
-      entry.size = 0
-      entry.modTime = getTime()
-    
-    entries.add(entry)
+      let i = getFileInfo(p)
+      if kind == pcDir: dirs.add((n, i.lastWriteTime))
+      else: files.add((n, i.size, i.lastWriteTime))
+    except: discard
 
-  # Separate and sort
-  var dirs: seq[FileEntry] = @[]
-  var files: seq[FileEntry] = @[]
-  
-  for entry in entries:
-    if entry.isDir:
-      dirs.add(entry)
-    else:
-      files.add(entry)
-
-  var prefix = urlPath
-  if not prefix.endsWith("/"):
-    prefix &= "/"
-
-  # Display directories
-  for entry in dirs:
-    let encodedName = encodeUrl(entry.name, usePlus = false)
-    let timeAgo = formatTimeAgo(entry.modTime)
-    
+  # Directories
+  for d in dirs:
+    let enc = encodeUrl(d.name, usePlus = false)
+    let zipUrl = (if urlPath.endsWith("/"): urlPath else: urlPath & "/") & enc & "?zip=1"
     content.add(
-      "<div class='card dir'>" &
-      "<div class='card-left'>" &
-      "<a href='" & prefix & encodedName & "/'>" &
-      "<span class='icon'>📁</span>" &
-      "<div class='file-info'>" &
-      "<span class='file-name'>" & entry.name & "/</span>" &
-      "<span class='file-meta'>" & timeAgo & "</span>" &
-      "</div>" &
-      "</a>" &
-      "</div></div>"
-    )
-
-  # Display files (WITH QR BUTTON)
-  for entry in files:
-    let encodedName = encodeUrl(entry.name, usePlus = false)
-    let sizeStr = formatFileSize(entry.size)
-    let timeAgo = formatTimeAgo(entry.modTime)
-    let fileUrl = prefix & encodedName
-    
-    content.add(
-      "<div class='card file'>" &
-      "<div class='card-left'>" &
-      "<a href='" & fileUrl & "'>" &
-      "<span class='icon'>📄</span>" &
-      "<div class='file-info'>" &
-      "<span class='file-name'>" & entry.name & "</span>" &
-      "<span class='file-meta'>" & sizeStr & " • " & timeAgo & "</span>" &
-      "</div>" &
-      "</a>" &
-      "</div>" &
-      "<button class='qr-btn' onclick=\"showQR('" & fileUrl & "')\">📱 QR</button>" &
+      "<div class='card dir'><div class='card-left'><a href='" & enc &
+      "/'><span class='icon'>📁</span>" &
+      "<div class='file-info'><span class='file-name'>" & d.name & "/</span>" &
+      "<span class='file-meta'>" & formatTimeAgo(d.time) &
+          "</span></div></a></div>" &
+      "<a href='" & zipUrl & "' download='" & d.name &
+          ".zip' style='width:auto;'><button class='btn'>📦 ZIP</button></a>" &
       "</div>"
     )
 
+  # Files
+  for f in files:
+    let enc = encodeUrl(f.name, usePlus = false)
+    let url = (if urlPath.endsWith("/"): urlPath else: urlPath & "/") & enc
+    content.add(
+      "<div class='card file'><div class='card-left'><a href='" & enc &
+      "'><span class='icon'>📄</span>" &
+      "<div class='file-info'><span class='file-name'>" & f.name & "</span>" &
+      "<span class='file-meta'>" & formatFileSize(f.size) & " • " &
+          formatTimeAgo(f.time) & "</span></div></a></div>" &
+      "<button class='btn' onclick=\"showQR('" & url & "')\">📱 QR</button></div>"
+    )
+
   pageTemplate("Index of " & urlPath, content)
-
-# --------------------------
-# Upload Handling
-# --------------------------
-
-proc handleUpload(req: Request, path: string, maxSizeBytes: int): tuple[success: bool, error: string] =
-  if req.headers.getOrDefault("Content-Type").startsWith("multipart/form-data"):
-    let data = req.body
-
-    # Check size limit
-    if data.len > maxSizeBytes:
-      return (false, "File too large. Maximum size: " & $(maxSizeBytes div (1024 * 1024)) & " MB")
-
-    var filename = "upload.bin"
-    let lines = data.split("\r\n")
-    for line in lines:
-      if line.contains("Content-Disposition") and line.contains("filename="):
-        let start = line.find("filename=\"")
-        if start != -1:
-          let nameStart = start + 10
-          let nameEnd = line.find("\"", nameStart)
-          if nameEnd != -1:
-            filename = line[nameStart ..< nameEnd]
-            if filename == "":
-              return (false, "No file selected")
-            break
-
-    let start = data.find("\r\n\r\n")
-    if start != -1:
-      let boundaryStart = data.find("------WebKitFormBoundary", start + 4)
-      var fileData: string
-      if boundaryStart != -1:
-        fileData = data[start + 4 ..< boundaryStart - 2]
-      else:
-        fileData = data[start + 4 ..< data.len]
-
-      if fileData.len > 0 and filename != "" and filename != "upload.bin":
-        let fullPath = path / filename
-        try:
-          writeFile(fullPath, fileData)
-          return (true, "")
-        except IOError as e:
-          return (false, "Failed to write file: " & e.msg)
-
-  return (false, "Invalid upload request")
 
 # --------------------------
 # MIME type getter
@@ -526,23 +367,14 @@ proc getMime(ext: string): string =
   else: "application/octet-stream"
 
 # --------------------------
-# MAIN LOGIC
+# Main
 # --------------------------
 
 proc main() =
-  # --------------------------
-  # CLI Arguments Parsing
-  # --------------------------
   var port = 8000
   var host = "0.0.0.0"
   var serveDir = "."
-  var maxSizeMB = 100  # Default 100MB
-
-  # State flags for parsing split arguments (e.g., -d ./folder)
-  var expectingDir = false
-  var expectingPort = false
-  var expectingHost = false
-  var expectingMaxSize = false
+  var maxSizeMB = 100
 
   var p = initOptParser()
   while true:
@@ -550,143 +382,97 @@ proc main() =
     case p.kind
     of cmdEnd: break
     of cmdShortOption, cmdLongOption:
-      # Reset expectation flags if a new flag is found
-      expectingDir = false; expectingPort = false; expectingHost = false; expectingMaxSize = false
-
       case p.key
-      of "p", "port":
-        if p.val.len > 0: port = parseInt(p.val)
-        else: expectingPort = true
-      of "H", "host":
-        if p.val.len > 0: host = p.val
-        else: expectingHost = true
-      of "d", "dir":
-        if p.val.len > 0: serveDir = p.val
-        else: expectingDir = true
-      of "m", "max-size":
-        if p.val.len > 0: maxSizeMB = parseInt(p.val)
-        else: expectingMaxSize = true
-      of "v", "version":
-        showVersion()
-      of "h", "help":
-        showHelp()
-      else:
-        echo "Unknown option: ", p.key
-        showHelp()
+      of "p", "port": port = parseInt(p.val)
+      of "H", "host": host = p.val
+      of "d", "dir": serveDir = p.val
+      of "m", "max-size": maxSizeMB = parseInt(p.val)
+      of "v", "version": showVersion()
+      of "h", "help": showHelp()
+    of cmdArgument: serveDir = p.key
 
-    of cmdArgument:
-      # Handle values that were separated by space (e.g. -d ./foo)
-      if expectingDir:
-        serveDir = p.key
-        expectingDir = false
-      elif expectingPort:
-        port = parseInt(p.key)
-        expectingPort = false
-      elif expectingHost:
-        host = p.key
-        expectingHost = false
-      elif expectingMaxSize:
-        maxSizeMB = parseInt(p.key)
-        expectingMaxSize = false
-      else:
-        # If no flag was pending, assume bare arg is the directory
-        # This allows: nserve ./waw
-        serveDir = p.key
-
-  # Normalize serveDir
-  if serveDir.len > 1 and serveDir.endsWith(DirSep):
-    serveDir = serveDir[0 ..< ^1]
-
+  if serveDir.len > 1 and serveDir.endsWith(DirSep): serveDir = serveDir[0 ..< ^1]
   if not dirExists(serveDir):
-    echo "Error: Directory not found: '", serveDir, "'"
+    echo "Error: Directory not found"
     quit(1)
 
-  # Convert MB to bytes
-  let maxSizeBytes = maxSizeMB * 1024 * 1024
+  let maxBytes = maxSizeMB * 1024 * 1024
 
-  # --------------------------
-  # Request Callback (Closure)
-  # --------------------------
   proc cb(req: Request) {.async, gcsafe.} =
-    # Decode URL to handle spaces/symbols in paths
     let urlPath = req.url.path.decodeUrl()
+    let relPath = if urlPath.startsWith("/"): urlPath[1..^1] else: urlPath
+    let fsPath = serveDir / relPath
+    let client = req.hostname # Async simpler client IP
 
-    # Remove leading slash to join correctly with serveDir
-    let relativePath = if urlPath.startsWith("/"): urlPath[1..^1] else: urlPath
+    # 1. HANDLE ZIP DOWNLOAD
+    if req.url.query.contains("zip=1") and dirExists(fsPath):
+      try:
+        echo "Creating ZIP for: ", fsPath
+        # Directly get string data from memory (FIXED HERE)
+        let zipData = zipDirectory(fsPath)
+        let dirName = extractFilename(fsPath)
+        let zipName = if dirName == "": "root.zip" else: dirName & ".zip"
 
-    # Construct full file system path based on serveDir
-    var fsPath = serveDir / relativePath
-
-    var statusCode = Http200
-
-    let clientAddr =
-      if req.headers.hasKey("X-Forwarded-For"):
-        $req.headers["X-Forwarded-For"]
-      else:
-        try:
-          let peer = req.client.getPeerAddr()
-          peer[0] & ":" & $peer[1]
-        except:
-          req.hostname
-
-    if req.reqMethod == HttpPost and dirExists(fsPath):
-      let (success, error) = handleUpload(req, fsPath, maxSizeBytes)
-      if success:
-        statusCode = Http200
-        logRequest(req.reqMethod, req.url.path, statusCode, clientAddr)
-        await req.respond(
-          statusCode,
-          pageTemplate("Uploaded",
-            "<h2>✓ File uploaded successfully.</h2><a href='" & req.url.path & "'>Back</a>"
-          )
-        )
-      else:
-        statusCode = Http413  # Payload Too Large
-        logRequest(req.reqMethod, req.url.path, statusCode, clientAddr)
-        await req.respond(
-          statusCode,
-          pageTemplate("Upload Failed",
-            "<h2>✗ Upload Failed</h2><p class='error'>" & error & "</p><a href='" & req.url.path & "'>Back</a>"
-          )
-        )
+        logRequest(req.reqMethod, req.url.path & " (ZIP)", Http200, client)
+        await req.respond(Http200, zipData, newHttpHeaders([
+          ("Content-Type", "application/zip"),
+          ("Content-Disposition", "attachment; filename=\"" & zipName & "\"")
+        ]))
+      except Exception as e:
+        echo "ZIP Error: ", e.msg
+        await req.respond(Http500, "Error creating ZIP: " & e.msg)
       return
 
+    # 2. HANDLE UPLOAD
+    if req.reqMethod == HttpPost and dirExists(fsPath):
+      let data = req.body
+      if data.len > maxBytes:
+        await req.respond(Http413, pageTemplate("Error",
+            "<h1>File too large</h1>"))
+        return
+
+      # Simple parser
+      if "filename=\"" in data:
+        let s = data.find("filename=\"") + 10
+        let e = data.find("\"", s)
+        let fname = data[s ..< e]
+        if fname.len > 0:
+          let bStart = data.find("\r\n\r\n")
+          if bStart != -1:
+            let content = data[bStart+4 ..< ^1] # Rough trim, works for simple uploads
+ # Basic trim of trailing boundary (approximate)
+            let realEnd = content.rfind("------WebKitFormBoundary")
+            if realEnd > 0:
+              try:
+                writeFile(fsPath / fname, content[0 ..< realEnd-2])
+                logRequest(req.reqMethod, req.url.path, Http200, client)
+                await req.respond(Http200, pageTemplate("Success",
+                    "<h1>Uploaded!</h1><a href='"&req.url.path&"'>Back</a>"))
+                return
+              except: discard
+
+      await req.respond(Http400, pageTemplate("Error",
+          "<h1>Upload Failed</h1>"))
+      return
+
+    # 3. SERVE FILES / DIRS
     if dirExists(fsPath):
       if not req.url.path.endsWith("/"):
-        let indexPath = fsPath / "index.html"
-        if fileExists(indexPath):
-          let mime = getMime(".html")
-          statusCode = Http200
-          logRequest(req.reqMethod, req.url.path, statusCode, clientAddr)
-          await req.respond(
-            statusCode,
-            readFile(indexPath),
-            newHttpHeaders([("Content-Type", mime)])
-          )
+        if fileExists(fsPath / "index.html"):
+          await req.respond(Http200, readFile(fsPath / "index.html"),
+              newHttpHeaders([("Content-Type", "text/html")]))
           return
-
-      statusCode = Http200
-      logRequest(req.reqMethod, req.url.path, statusCode, clientAddr)
-      await req.respond(statusCode, dirListing(fsPath, req.url.path, maxSizeMB))
-
+      logRequest(req.reqMethod, req.url.path, Http200, client)
+      await req.respond(Http200, dirListing(fsPath, req.url.path, maxSizeMB))
     elif fileExists(fsPath):
-      let (_, _, ext) = splitFile(fsPath)
+      logRequest(req.reqMethod, req.url.path, Http200, client)
+      let ext = splitFile(fsPath).ext.toLowerAscii
       let mime = getMime(ext)
-      statusCode = Http200
-      logRequest(req.reqMethod, req.url.path, statusCode, clientAddr)
-      await req.respond(
-        statusCode,
-        readFile(fsPath),
-        newHttpHeaders([("Content-Type", mime)])
-      )
-
+      await req.respond(Http200, readFile(fsPath), newHttpHeaders([(
+          "Content-Type", mime)]))
     else:
-      statusCode = Http404
-      logRequest(req.reqMethod, req.url.path, statusCode, clientAddr)
-      await req.respond(
-        statusCode,
-        pageTemplate("404", "<h1>404 Not Found</h1>")
-      )
+      logRequest(req.reqMethod, req.url.path, Http404, client)
+      await req.respond(Http404, pageTemplate("404", "<h1>Not Found</h1>"))
 
   # --------------------------
   # Start Server
@@ -706,5 +492,4 @@ proc main() =
 
   waitFor server.serve(Port(port), cb, host)
 
-# Run the main procedure
 main()
