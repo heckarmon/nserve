@@ -13,15 +13,27 @@
 - 📤 **File Upload** - Simple file uploads to any directory
 - 🛑 **Upload Limits** - Configurable maximum file size limit (default 100MB) to prevent server overload
 - 📱 **QR Code Sharing** - Instant offline QR code generation for sharing files to mobile devices
+- 📦 **Directory Zipping** - On-the-fly ZIP archive creation to download entire folders, with instant QR code support for mobile transfer.
 - 🎨 **Theme Toggle** - Dark/light mode with persistent preferences using localStorage
 - 📊 **Detailed Logging** - Color-coded logs with timestamps and **real client IP/Port tracking**
 - 🔧 **Configurable** - Custom host and port via CLI arguments
 - 🌐 **MIME Type Detection** - Automatic content-type detection for common file types
-- ⚡ **Async/Non-blocking** - Built on Nim's async I/O (`asynchttpserver` + `asyncnet`) for high performance
+- ⚡ **Async/Non-blocking** - Built on Nim's async I/O (`asynchttpserver`) for high performance
 - 🎯 **Single Binary** - Compiles to a standalone executable with **zero dependencies**
 - 🪶 **Lightweight** - Minimal memory footprint, no external libraries needed
 
 ## Installation 📦
+
+### 📥 Download Binaries (No Install Needed)
+
+Don't want to compile? Grab the latest standalone executable for your platform directly from the releases page:
+
+| Platform | Arch | Download Link |
+| :--- | :--- | :--- |
+| **Windows** | x64 | [**nserve_v1.0.4_windows_amd64.exe**](https://github.com/heckarmon/nserve/releases/download/v1.0.4/nserve_v1.0.4_windows_amd64.exe) |
+| **Linux** | x64 | [**nserve_v1.0.4_linux_amd64.elf**](https://github.com/heckarmon/nserve/releases/download/v1.0.4/nserve_v1.0.4_linux_amd64.elf) |
+
+*Just download, give it execution permissions (on Linux `chmod +x`), and run!*
 
 ### Via Nimble (Recommended)
 Since nserve is published on the official Nim package registry, you can install it with a single command:

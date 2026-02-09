@@ -1,6 +1,6 @@
 # Package
 
-version       = "1.0.3"
+version       = "1.0.4"
 author        = "heckarmon"
 description   = "A lightweight zero-deps, async HTTP file server with uploads"
 license       = "MIT"

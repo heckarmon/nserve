@@ -2,7 +2,7 @@ import asynchttpserver, asyncdispatch, os, strutils, uri, parseopt, times, strfo
 import streams
 
 const
-  VERSION = "1.0.5"
+  VERSION = "1.0.4"
   # Embed JS/CSS here to keep logic clean
   QR_LIB = staticRead("static/qrcode.min.js")
   CSS_STYLES = """
@@ -36,7 +36,7 @@ type ZipFileEntry = object
   name: string
   data: string
   crc32: uint32
-  time: DosFileTime # <--- Now valid
+  time: DosFileTime
   uncompressedSize: uint32
   compressedSize: uint32
   localHeaderOffset: uint32
@@ -261,7 +261,10 @@ proc renderDirListing(path, urlPath: string, maxSizeMB: int): string =
             </div>
           </a>
         </div>
-        <a href='{zipUrl}' download='{d.name}.zip'><button class='btn'>📦 ZIP</button></a>
+        <div style="display:flex; align-items:center;">
+          <a href='{zipUrl}' download='{d.name}.zip'><button class='btn'>📦 ZIP</button></a>
+          <button class='btn' onclick="showQR('{zipUrl}')">📱 QR</button>
+        </div>
       </div>""")
 
   # Render Files
